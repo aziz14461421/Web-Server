@@ -17,15 +17,15 @@ type TCPConn = {
 function soInit(socket: net.Socket): TCPConn {
   const conn: TCPConn = {
     socket,
-    reader: null,
+    reader: null
   };
 
   // Fired when data arrives
   socket.on("data", (data: Buffer) => {
-    console.assert(conn.reader);         // Ensure read is pending
-    conn.socket.pause();                 // Pause more 'data' events
-    conn.reader!.resolve(data);          // Fulfill current read
-    conn.reader = null;                  // Clear reader
+    console.assert(conn.reader); // Ensure read is pending
+    conn.socket.pause(); // Pause more 'data' events
+    conn.reader!.resolve(data); // Fulfill current read
+    conn.reader = null; // Clear reader
   });
 
   // Fired when the client closes connection (EOF)
@@ -52,8 +52,8 @@ function soInit(socket: net.Socket): TCPConn {
 // ----------------------------------------------------
 function soRead(conn: TCPConn): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    conn.reader = { resolve, reject };  // Store the callbacks
-    conn.socket.resume();               // Resume 'data' events
+    conn.reader = { resolve, reject }; // Store the callbacks
+    conn.socket.resume(); // Resume 'data' events
   });
 }
 
@@ -99,7 +99,7 @@ function bufPush(buf: DynBuf, data: Buffer): void {
 // Cut message from dynamic buffer
 // ----------------------------------------------------
 function cutMessage(buf: DynBuf): Buffer | null {
-  const idx = buf.data.subarray(0, buf.length).indexOf('\n');
+  const idx = buf.data.subarray(0, buf.length).indexOf("\n");
   if (idx < 0) return null;
   const msg = buf.data.subarray(0, idx + 1);
   bufPop(buf, idx + 1);
@@ -134,14 +134,14 @@ async function newConn(conn: TCPConn): Promise<void> {
       const str = msg.toString().trim();
       if (str.includes("q")) {
         await soWrite(conn, Buffer.from("Bye.\n"));
-        break;  // Exit loop after sending "Bye"
+        break; // Exit loop after sending "Bye"
       }
       await soWrite(conn, Buffer.from(`Echo: ${str}\n`));
     }
   } catch (err) {
     console.error("connection error:", err);
   } finally {
-    conn.socket.end();                     // Gracefully close socket
+    conn.socket.end(); // Gracefully close socket
     console.log("FIN.");
   }
 }
@@ -150,13 +150,13 @@ async function newConn(conn: TCPConn): Promise<void> {
 // Create the TCP server
 // ----------------------------------------------------
 const server = net.createServer({ pauseOnConnect: true });
-server.on("connection", (socket) => {
+server.on("connection", socket => {
   const conn = soInit(socket);
   newConn(conn).catch(console.error);
 });
 
 server.on("listening", () => console.log("Server listening on 127.0.0.1:1234"));
-server.on("error", (err) => console.error("Server error:", err));
+server.on("error", err => console.error("Server error:", err));
 
 // ----------------------------------------------------
 // Start listening
