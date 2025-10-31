@@ -17,9 +17,11 @@ type HTTPRes = { code: number; headers: Buffer[]; body: BodyReader };
 
 type BodyReader = { length: number; read: () => Promise<Buffer> };
 
-type HTTPError = { name: "HTTPError"; code: number; message: string };
-function HTTPError(code: number, message: string): HTTPError {
-  return { name: "HTTPError", code, message };
+class HTTPError extends Error {
+  readonly name = "HTTPError" as const;
+  constructor(public code: number, message: string) {
+    super(message);
+  }
 }
 
 /* ==================== TCP WRAPPER ==================== */
@@ -91,7 +93,7 @@ function cutMessage(buf: DynBuf): HTTPReq | null {
   const view = buf.data.subarray(0, buf.length);
   const idx = view.indexOf("\r\n\r\n");
   if (idx < 0) {
-    if (buf.length >= kMaxHeaderLen) throw HTTPError(413, "header too large");
+    if (buf.length >= kMaxHeaderLen) throw new HTTPError(413, "header too large");
     return null;
   }
   const msg = parseHTTPReq(view.subarray(0, idx + 4));
@@ -108,9 +110,9 @@ function splitLines(data: Buffer): Buffer[] {
 
 function parseRequestLine(line: Buffer): [string, Buffer, string] {
   const parts = line.toString().trim().split(" ");
-  if (parts.length !== 3) throw HTTPError(400, "bad request line");
+  if (parts.length !== 3) throw new HTTPError(400, "bad request line");
   const [method, uriStr, version] = parts;
-  if (!version.startsWith("HTTP/")) throw HTTPError(400, "bad version");
+  if (!version.startsWith("HTTP/")) throw new HTTPError(400, "bad version");
   return [method, Buffer.from(uriStr), version.slice(5)];
 }
 
@@ -128,7 +130,7 @@ function parseHTTPReq(data: Buffer): HTTPReq {
   const headers: Buffer[] = [];
   for (let i = 1; i < lines.length - 1; i++) {
     const h = Buffer.from(lines[i]);
-    if (!validateHeader(h)) throw HTTPError(400, "bad field");
+    if (!validateHeader(h)) throw new HTTPError(400, "bad field");
     headers.push(h);
   }
   console.assert(lines[lines.length - 1].length === 0);
@@ -155,7 +157,7 @@ function parseDec(str: string): number {
 
 /* ==================== BODY READER (Content-Length) ==================== */
 
-function readerFromConnLength(conn: TCPConn, buf: DynBuf, remain: number): BodyReader {
+function readerFromConLength(conn: TCPConn, buf: DynBuf, remain: number): BodyReader {
   return {
     length: remain,
     read: async (): Promise<Buffer> => {
@@ -181,7 +183,7 @@ function readerFromReq(conn: TCPConn, buf: DynBuf, req: HTTPReq): BodyReader {
   const cl = fieldGet(req.headers, "Content-Length");
   if (cl) {
     bodyLen = parseDec(cl.toString("latin1"));
-    if (isNaN(bodyLen)) throw HTTPError(400, "bad Content-Length");
+    if (isNaN(bodyLen)) throw new HTTPError(400, "bad Content-Length");
   }
 
   const bodyAllowed = !(req.method === "GET" || req.method === "HEAD");
@@ -189,20 +191,72 @@ function readerFromReq(conn: TCPConn, buf: DynBuf, req: HTTPReq): BodyReader {
     fieldGet(req.headers, "Transfer-Encoding")?.equals(Buffer.from("chunked")) ?? false;
 
   if (!bodyAllowed && (bodyLen > 0 || chunked)) {
-    throw HTTPError(400, "HTTP body not allowed");
+    throw new HTTPError(400, "HTTP body not allowed");
   }
   if (!bodyAllowed) bodyLen = 0;
 
   if (bodyLen >= 0) {
-    return readerFromConnLength(conn, buf, bodyLen);
+    return readerFromConLength(conn, buf, bodyLen);
   } else if (chunked) {
-    throw HTTPError(501, "chunked not implemented");
+    throw new HTTPError(501, "chunked not implemented");
   } else {
-    throw HTTPError(501, "unknown body type");
+    throw new HTTPError(501, "unknown body type");
   }
 }
+/* ==================== RESPONSE HANDLER =============== */
+async function HandleReq(req: HTTPReq, body: BodyReader): Promise<HTTPRes> {
+  let resp: BodyReader; // body
+  switch (req.uri.toString("latin1")) {
+    case "/echo":
+      resp = body;
+      break;
+    default:
+      resp = readerFromMemory(Buffer.from("Hello World.\n"));
+      break;
+  }
+  return {
+    code: 200,
+    headers: [Buffer.from("Server:my_first_http_server")],
+    body: resp
+  };
+}
 
-/* ==================== SERVER LOOP (Incomplete – Step 5 Ends Here) ==================== */
+function readerFromMemory(data: Buffer): BodyReader {
+  let done = false;
+  return {
+    length: data.length,
+    read: async (): Promise<Buffer> => {
+      if (done) Buffer.from("");
+      done = true;
+      return data;
+    }
+  };
+}
+/* ==================== RESPONSE ENCODER/WRITER ==================== */
+async function writeHTTPResp(conn: TCPConn, resp: HTTPRes): Promise<void> {
+  if (resp.body.length < 0) throw new Error("TODO: chunked encoding");
+  resp.headers.push(Buffer.from(`Content-Length: ${resp.body.length}`));
+  // write the header
+  await soWrite(conn, encodeHTTPResp(resp));
+  // write the body
+  while (true) {
+    const data: Buffer = await resp.body.read();
+    if (data.length === 0) break;
+    await soWrite(conn, data);
+  }
+}
+function encodeHTTPResp(res: HTTPRes): Buffer {
+  const statusLine = `HTTP/1.1 ${res.code} OK\r\n`;
+  const parts: string[] = [statusLine];
+
+  for (const h of res.headers) {
+    parts.push(h.toString("latin1") + "\r\n");
+  }
+
+  parts.push("\r\n");
+  return Buffer.from(parts.join(""));
+}
+/* ==================== SERVER LOOP ==================== */
 
 async function serveClient(conn: TCPConn): Promise<void> {
   const buf: DynBuf = { data: Buffer.alloc(0), length: 0 };
@@ -212,34 +266,28 @@ async function serveClient(conn: TCPConn): Promise<void> {
       const data = await soRead(conn);
       bufPush(buf, data);
       if (data.length === 0 && buf.length === 0) return;
-      if (data.length === 0) throw HTTPError(400, "Unexpected EOF");
+      if (data.length === 0) throw new HTTPError(400, "Unexpected EOF");
       continue;
     }
-    // Step 6+ continues here: handleReq, writeHTTPResp, drain body, etc.
+    const reqBody: BodyReader = readerFromReq(conn, buf, msg);
+    const res: HTTPRes = await HandleReq(msg, reqBody);
   }
 }
 
 async function newConn(socket: net.Socket): Promise<void> {
-  const conn: TCPConn = soInit(socket);
-
+  const conn = soInit(socket);
   try {
     await serveClient(conn);
-  } catch (exc) {
-    console.error("exception:", exc);
-
-    if (exc instanceof HTTPError) {
-      // intended to send an error response
-      const resp: HTTPRes = {
-        code: exc.code,
-        headers: [],
-        body: readerFromMemory(Buffer.from(exc.message + "\n"))
-      };
-
+  } catch (e: unknown) {
+    console.error("exception:", e);
+    if (e instanceof HTTPError) {
       try {
-        await writeHTTPResp(conn, resp);
-      } catch (exc) {
-        /* ignore */
-      }
+        await writeHTTPResp(conn, {
+          code: e.code,
+          headers: [],
+          body: readerFromMemory(Buffer.from(e.message + "\n")),
+        });
+      } catch (e) {/* Ignore*/}
     }
   } finally {
     socket.destroy();
