@@ -19,7 +19,10 @@ type BodyReader = { length: number; read: () => Promise<Buffer> };
 
 class HTTPError extends Error {
   readonly name = "HTTPError" as const;
-  constructor(public code: number, message: string) {
+  constructor(
+    public code: number,
+    message: string
+  ) {
     super(message);
   }
 }
@@ -118,17 +121,24 @@ function parseRequestLine(line: Buffer): [string, Buffer, string] {
 
 function validateHeader(line: Buffer): boolean {
   const str = line.toString();
+  console.log(`Validating: "${str}"`);
   const idx = str.indexOf(":");
-  if (idx <= 0 || idx === str.length - 1) return false;
-  const name = str.slice(0, idx);
-  return /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name);
+  if (idx <= 0 || idx === str.length - 1) {
+    console.log(`Failed format: "${str}"`);
+    return false;
+  }
+  const name = str.slice(0, idx).trim();
+  const valid = /^[!#$%&'*+\-.^_`|~0-9A-Za-z/*]+$/.test(name);
+  if (!valid) console.log(`Invalid name: "${name}"`);
+  return valid;
 }
 
 function parseHTTPReq(data: Buffer): HTTPReq {
   const lines = splitLines(data);
   const [method, uri, version] = parseRequestLine(lines[0]);
   const headers: Buffer[] = [];
-  for (let i = 1; i < lines.length - 1; i++) {
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i].length === 0) break;
     const h = Buffer.from(lines[i]);
     if (!validateHeader(h)) throw new HTTPError(400, "bad field");
     headers.push(h);
@@ -226,7 +236,7 @@ function readerFromMemory(data: Buffer): BodyReader {
   return {
     length: data.length,
     read: async (): Promise<Buffer> => {
-      if (done) Buffer.from("");
+      if (done) return Buffer.from("");
       done = true;
       return data;
     }
@@ -271,6 +281,7 @@ async function serveClient(conn: TCPConn): Promise<void> {
     }
     const reqBody: BodyReader = readerFromReq(conn, buf, msg);
     const res: HTTPRes = await HandleReq(msg, reqBody);
+    await writeHTTPResp(conn, res);
   }
 }
 
@@ -285,9 +296,11 @@ async function newConn(socket: net.Socket): Promise<void> {
         await writeHTTPResp(conn, {
           code: e.code,
           headers: [],
-          body: readerFromMemory(Buffer.from(e.message + "\n")),
+          body: readerFromMemory(Buffer.from(e.message + "\n"))
         });
-      } catch (e) {/* Ignore*/}
+      } catch (e) {
+        /* Ignore*/
+      }
     }
   } finally {
     socket.destroy();
