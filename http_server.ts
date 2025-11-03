@@ -27,6 +27,14 @@ class HTTPError extends Error {
   }
 }
 
+type BufferedWriter = {
+  write: (data: Buffer) => Promise<void>;
+  flush: () => Promise<void>;
+  buffer: Buffer;
+  length: number;
+  conn: TCPConn;
+};
+
 /* ==================== TCP WRAPPER ==================== */
 
 function soInit(socket: net.Socket): TCPConn {
@@ -69,7 +77,40 @@ function soWrite(conn: TCPConn, data: Buffer): Promise<void> {
   });
 }
 
-/* ==================== DYNAMIC BUFFER ==================== */
+/* ==================== DYNAMIC WRITE-BUFFER ==================== */
+function createBufferedWriter(conn: TCPConn): BufferedWriter {
+  const writer: BufferedWriter = {
+    conn,
+    buffer: Buffer.alloc(4096),
+    length: 0,
+    async write(data: Buffer): Promise<void> {
+      while (data.length !== 0) {
+        const free: number = this.buffer.length - this.length;
+        // flush and write data if it's larger than the buffer
+        if (data.length > this.buffer.length) {
+          await this.flush();
+          conn.socket.write(data);
+          break;
+        }
+        if (data.length > free) {
+          // buffer full empty then push data
+          data.copy(this.buffer, this.length, 0, free);
+          this.length += free;
+          await this.flush();
+          data = data.subarray(free);
+          continue;
+        }
+        // buffer can still contain -> push data
+        data.copy(this.buffer, this.length);
+        this.length += data.length;
+        break;
+      }
+    },
+    async flush(): Promise<void> {}
+  };
+  return writer;
+}
+/* ==================== DYNAMIC READ-BUFFER ==================== */
 
 function bufPush(buf: DynBuf, data: Buffer): void {
   const newLen = buf.length + data.length;
@@ -309,7 +350,7 @@ async function newConn(socket: net.Socket): Promise<void> {
 
 /* ==================== SERVER STARTUP ==================== */
 
-const server = net.createServer({ pauseOnConnect: true });
+const server = net.createServer({ pauseOnConnect: true, noDelay: true });
 
 server.on("connection", socket => {
   newConn(socket).catch(console.error);
