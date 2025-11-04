@@ -326,7 +326,7 @@ function readerFromGenerator(gen: BufferGenerator): BodyReader {
   };
 }
 async function* countSheep(): BufferGenerator {
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 10; i++) {
     await new Promise(resolve => setTimeout(resolve, 1000));
     yield Buffer.from(`${i}\n`);
   }
