@@ -2,6 +2,7 @@
 // Node.js + TypeScript – No external HTTP libraries
 
 import * as net from "net";
+import * as fs from "fs/promises";
 
 /* ==================== TYPES ==================== */
 
@@ -15,7 +16,7 @@ type DynBuf = { data: Buffer; length: number };
 type HTTPReq = { method: string; uri: Buffer; version: string; headers: Buffer[] };
 type HTTPRes = { code: number; headers: Buffer[]; body: BodyReader };
 
-type BodyReader = { length: number; read: () => Promise<Buffer> };
+type BodyReader = { length: number; read: () => Promise<Buffer>; close?: () => Promise<void> };
 
 class HTTPError extends Error {
   readonly name = "HTTPError" as const;
@@ -36,6 +37,31 @@ type BufferedWriter = {
 };
 
 type BufferGenerator = AsyncGenerator<Buffer, void, void>;
+/* ==================== INTERFACES ==================== */
+interface FileReadResult {
+  bytesRead: number;
+  buffer: Buffer;
+}
+interface FileReadOptions {
+  buffer?: Buffer;
+  offset?: number | null;
+  length?: number | null;
+  position?: number | null;
+}
+interface Stats {
+  isFile(): boolean;
+  isDir(): boolean;
+  size: number;
+}
+interface FileHandle {
+  read(options?: FileReadOptions): Promise<FileReadResult>;
+  close(): Promise<void>;
+  stats(): Promise<Stats>;
+}
+/* ==================== FILE & RESOURCE MANAGEMENT ==================== */
+function open(path: string, flags?: string): Promise<FileHandle> | null {
+  return null;
+}
 
 /* ==================== TCP WRAPPER ==================== */
 
@@ -292,8 +318,12 @@ function readerFromReq(conn: TCPConn, buf: DynBuf, req: HTTPReq): BodyReader {
 }
 /* ==================== RESPONSE HANDLER =============== */
 async function HandleReq(req: HTTPReq, body: BodyReader): Promise<HTTPRes> {
-  let resp: BodyReader; // body
-  switch (req.uri.toString("latin1")) {
+  let resp: BodyReader;
+  const uri = req.uri.toString("latin1");
+  if (uri.startsWith("/files/")) {
+    return await serveStaticFile(uri.substring("/files/".length));
+  }
+  switch (uri) {
     case "/echo":
       resp = body;
       break;
@@ -310,7 +340,53 @@ async function HandleReq(req: HTTPReq, body: BodyReader): Promise<HTTPRes> {
     body: resp
   };
 }
+async function serveStaticFile(path: string): Promise<HTTPRes> {
+  let fp: null | fs.FileHandle = null;
+  try {
+    fp = await fs.open(path, "r");
+    const stat = await fp.stat();
+    if (!stat.isFile()) {
+      return resp404();
+    }
+    const size = stat.size;
+    try {
+      const reader: BodyReader = readerFromStaticFile(fp, size);
+      return { code: 200, headers: [], body: reader };
+    } finally {
+      fp = null;
+    }
+  } catch (e) {
+    console.info("error serving file ", e);
+    return resp404();
+  } finally {
+    await fp?.close();
+  }
+}
+function resp404(): HTTPRes {
+  return {
+    code: 404,
+    headers: [Buffer.from("Content-Type: text/plain"), Buffer.from("Server: my_first_http_server")],
+    body: readerFromMemory(Buffer.from("404 Not Found\n"))
+  };
+}
 
+function readerFromStaticFile(fp: fs.FileHandle, size: number): BodyReader {
+  const buf = Buffer.allocUnsafe(65536)
+  let got = 0;
+  return {
+    length: size,
+    read: async (): Promise<Buffer> => {
+      const r = await fp.read({buffer: buf});
+      // CAUTION: the lifetime of the buffer is unclear!
+      got += r.bytesRead;
+      if (got > size || (got < size && r.bytesRead === 0)) {
+        throw new Error("filesize changed, abandon it!");
+      }
+      return r.buffer.subarray(0, r.bytesRead);
+    },
+    close: async () => await fp.close()
+  };
+}
 function readerFromGenerator(gen: BufferGenerator): BodyReader {
   return {
     length: -1,
@@ -322,6 +398,9 @@ function readerFromGenerator(gen: BufferGenerator): BodyReader {
         console.assert(r.value.length > 0);
         return r.value;
       }
+    },
+    close: async (): Promise<void> =>{
+      await gen.return()
     }
   };
 }
@@ -391,7 +470,11 @@ async function serveClient(conn: TCPConn): Promise<void> {
     }
     const reqBody: BodyReader = readerFromReq(conn, buf, msg);
     const res: HTTPRes = await HandleReq(msg, reqBody);
-    await writeHTTPResp(conn, res);
+    try {
+      await writeHTTPResp(conn, res);
+    } finally {
+      await res.body.close?.();
+    }
   }
 }
 
