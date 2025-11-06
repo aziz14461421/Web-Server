@@ -37,6 +37,8 @@ type BufferedWriter = {
 };
 
 type BufferGenerator = AsyncGenerator<Buffer, void, void>;
+
+type HTTPRange = [number, number | null] | number;
 /* ==================== INTERFACES ==================== */
 interface FileReadResult {
   bytesRead: number;
@@ -56,11 +58,7 @@ interface Stats {
 interface FileHandle {
   read(options?: FileReadOptions): Promise<FileReadResult>;
   close(): Promise<void>;
-  stats(): Promise<Stats>;
-}
-/* ==================== FILE & RESOURCE MANAGEMENT ==================== */
-function open(path: string, flags?: string): Promise<FileHandle> | null {
-  return null;
+  stat(): Promise<Stats>;
 }
 
 /* ==================== TCP WRAPPER ==================== */
@@ -134,7 +132,12 @@ function createBufferedWriter(conn: TCPConn): BufferedWriter {
         break;
       }
     },
-    async flush(): Promise<void> {}
+    async flush(): Promise<void> {
+      if (this.length > 0) {
+        await soWrite(this.conn, this.buffer.subarray(0, this.length));
+        this.length = 0;
+      }
+    }
   };
   return writer;
 }
@@ -190,15 +193,12 @@ function parseRequestLine(line: Buffer): [string, Buffer, string] {
 
 function validateHeader(line: Buffer): boolean {
   const str = line.toString();
-  console.log(`Validating: "${str}"`);
   const idx = str.indexOf(":");
   if (idx <= 0 || idx === str.length - 1) {
-    console.log(`Failed format: "${str}"`);
     return false;
   }
   const name = str.slice(0, idx).trim();
   const valid = /^[!#$%&'*+\-.^_`|~0-9A-Za-z/*]+$/.test(name);
-  if (!valid) console.log(`Invalid name: "${name}"`);
   return valid;
 }
 
@@ -289,6 +289,29 @@ async function* readChunks(conn: TCPConn, buf: DynBuf): BufferGenerator {
     bufPop(buf, 2);
   }
 }
+/* ==================== RANGE REQUESTS ==================== */
+function parseBytesRanges(r: null | Buffer): HTTPRange[] {
+  if (!r) return [];
+  const str = r.toString("latin1").trim();
+  if (!str.startsWith("bytes=")) return [];
+  const list = str.slice("bytes=".length).split(",");
+  const ranges: HTTPRange[] = [];
+  for (const part of list) {
+    const [a, b] = part.trim().split("-");
+    if (a === "" && b) {
+      const suffixLen = parseInt(b, 10);
+      if (!isNaN(suffixLen)) ranges.push(-suffixLen);
+    } else if (a && b) {
+      const start = parseInt(a, 10);
+      const end = parseInt(b, 10);
+      if (!isNaN(start)) ranges.push([start, isNaN(end) ? null : end]);
+    } else if (a && !b) {
+      const start = parseInt(a, 10);
+      ranges.push([start, null]);
+    }
+  }
+  return ranges;
+}
 /* ==================== BODY READER FACTORY ==================== */
 
 function readerFromReq(conn: TCPConn, buf: DynBuf, req: HTTPReq): BodyReader {
@@ -317,11 +340,11 @@ function readerFromReq(conn: TCPConn, buf: DynBuf, req: HTTPReq): BodyReader {
   }
 }
 /* ==================== RESPONSE HANDLER =============== */
-async function HandleReq(req: HTTPReq, body: BodyReader): Promise<HTTPRes> {
+async function handleReq(req: HTTPReq, body: BodyReader): Promise<HTTPRes> {
   let resp: BodyReader;
   const uri = req.uri.toString("latin1");
   if (uri.startsWith("/files/")) {
-    return await serveStaticFile(uri.substring("/files/".length));
+    return await serveStaticFile(req, uri.substring("/files/".length));
   }
   switch (uri) {
     case "/echo":
@@ -340,7 +363,7 @@ async function HandleReq(req: HTTPReq, body: BodyReader): Promise<HTTPRes> {
     body: resp
   };
 }
-async function serveStaticFile(path: string): Promise<HTTPRes> {
+async function serveStaticFile(req: HTTPReq, path: string): Promise<HTTPRes> {
   let fp: null | fs.FileHandle = null;
   try {
     fp = await fs.open(path, "r");
@@ -349,12 +372,9 @@ async function serveStaticFile(path: string): Promise<HTTPRes> {
       return resp404();
     }
     const size = stat.size;
-    try {
-      const reader: BodyReader = readerFromStaticFile(fp, size);
-      return { code: 200, headers: [], body: reader };
-    } finally {
-      fp = null;
-    }
+    const res = await staticFileResp(req, fp, size);
+    fp = null;
+    return res;
   } catch (e) {
     console.info("error serving file ", e);
     return resp404();
@@ -370,16 +390,17 @@ function resp404(): HTTPRes {
   };
 }
 
-function readerFromStaticFile(fp: fs.FileHandle, size: number): BodyReader {
-  const buf = Buffer.allocUnsafe(65536)
-  let got = 0;
+function readerFromStaticFile(fp: fs.FileHandle, start: number, end: number): BodyReader {
+  const buf = Buffer.allocUnsafe(65536);
+  let offset = start;
   return {
-    length: size,
+    length: end - start,
     read: async (): Promise<Buffer> => {
-      const r = await fp.read({buffer: buf});
-      // CAUTION: the lifetime of the buffer is unclear!
-      got += r.bytesRead;
-      if (got > size || (got < size && r.bytesRead === 0)) {
+      const maxread = Math.min(buf.length, end - offset);
+      if (maxread <= 0) return Buffer.alloc(0);
+      const r = await fp.read({ buffer: buf, position: offset, length: maxread });
+      offset += r.bytesRead;
+      if (offset > end || (offset < end && r.bytesRead === 0)) {
         throw new Error("filesize changed, abandon it!");
       }
       return r.buffer.subarray(0, r.bytesRead);
@@ -399,8 +420,8 @@ function readerFromGenerator(gen: BufferGenerator): BodyReader {
         return r.value;
       }
     },
-    close: async (): Promise<void> =>{
-      await gen.return()
+    close: async (): Promise<void> => {
+      await gen.return();
     }
   };
 }
@@ -455,6 +476,66 @@ function encodeHTTPResp(res: HTTPRes): Buffer {
   parts.push("\r\n");
   return Buffer.from(parts.join(""));
 }
+
+async function staticFileResp(req: HTTPReq, fp: fs.FileHandle, size: number): Promise<HTTPRes> {
+  // 1. Parse Range header
+  const ranges = parseBytesRanges(fieldGet(req.headers, "Range"));
+  if (ranges.length === 0) {
+    // No Range → full file
+    const reader = readerFromStaticFile(fp, 0, size);
+    return {
+      code: 200,
+      headers: [],
+      body: reader
+    };
+  }
+
+  // 2. Only handle single range
+  const r = ranges[0];
+  let start = 0,
+    end = size;
+
+  if (typeof r === "number") {
+    // Suffix range: "-N"
+    const suffixLen = -r;
+    if (suffixLen <= 0) return resp416(size);
+    start = Math.max(size - suffixLen, 0);
+  } else {
+    // Normal range: "A-B" or "A-"
+    start = r[0];
+    end = r[1] !== null ? r[1] + 1 : size;
+  }
+
+  // 3. Validate range
+  if (start >= size || start < 0 || end <= start) {
+    return resp416(size);
+  }
+
+  // 4. Effective range
+  end = Math.min(end, size);
+  const length = end - start;
+
+  const reader = readerFromStaticFile(fp, start, end);
+  return {
+    code: 206,
+    headers: [
+      Buffer.from("Accept-Ranges: bytes"),
+      Buffer.from(`Content-Range: bytes ${start}-${end - 1}/${size}`)
+    ],
+    body: reader
+  };
+}
+function resp416(size: number): HTTPRes {
+  return {
+    code: 416,
+    headers: [
+      Buffer.from(`Content-Range: bytes */${size}`),
+      Buffer.from("Content-Type: text/plain")
+    ],
+    body: readerFromMemory(Buffer.from("Range Not Satisfiable\n"))
+  };
+}
+
 /* ==================== SERVER LOOP ==================== */
 
 async function serveClient(conn: TCPConn): Promise<void> {
@@ -469,7 +550,7 @@ async function serveClient(conn: TCPConn): Promise<void> {
       continue;
     }
     const reqBody: BodyReader = readerFromReq(conn, buf, msg);
-    const res: HTTPRes = await HandleReq(msg, reqBody);
+    const res: HTTPRes = await handleReq(msg, reqBody);
     try {
       await writeHTTPResp(conn, res);
     } finally {
